@@ -17,6 +17,7 @@ from scipy.stats import f_oneway
 from gevent import pywsgi
 from statsmodels.regression.mixed_linear_model import MixedLM
 from statsmodels.stats.anova import anova_lm
+from sklearn.cluster import KMeans
 
 app = Flask(__name__)
 
@@ -136,7 +137,7 @@ def notDiscreteFeatureDesc():
     colName = param['runParams'][0]
     pg_connection = connect_pg()
     tableName = param['tableName']
-    sql = f"select \"{colName}\" from {tableName}"
+    sql = f"select \"{colName}\" from \"{tableName}\""
     databaseData = pd.read_sql(sql, con=pg_connection);
     databaseData[colName] = pd.to_numeric(databaseData[colName], errors='coerce')
     total_count = databaseData.shape[0]
@@ -160,11 +161,11 @@ def notDiscreteFeatureDesc():
     print("min_value" ,min_value)
     res = {
         "total": total_count,
-        "average": mean,
-        "middle": median,
-        "min": min_value,
-        "max": max_value,
-        "mode": mode
+        "average": str(mean),
+        "middle": str(median),
+        "min": str(min_value),
+        "max": str(max_value),
+        "mode": str(mode)
 
     }
     print("aaaa")
@@ -374,7 +375,72 @@ def eucarFilling():
         "new_data": databaseData[colName].values.tolist()
     }
     print(res)
-    return json.dumps(res);
+    return json.dumps(res)
+
+@app.route("/clusterReplacement", methods=['POST'])
+def clusterFilling():
+    # 连接到数据库
+    param = request.get_json()
+    colName = param['runParams'][0]
+    pg_connection = connect_pg()
+    tableName = param['tableName']
+    sql = f"select * from \"{tableName}\""
+    databaseData = pd.read_sql(sql, con=pg_connection)
+    old_data = databaseData[colName].values.tolist()
+    print(databaseData)
+    print("data")
+    old_data = databaseData[colName].values.tolist()
+    sql_query = f"""
+         SELECT column_name
+         FROM information_schema.columns
+         WHERE table_name = '{tableName}' AND column_name !='{colName}'
+             AND data_type IN ('integer', 'bigint', 'smallint', 'numeric', 'real', 'double precision');
+     """
+    cols = pd.read_sql(sql_query, con=pg_connection)
+    print(cols)
+    # 获取指定列的数据
+    specified_column_data = cols['column_name']
+    # 遍历指定列的数据
+    col = []
+    for value in specified_column_data:
+        # 判断这个列在数据库中的确实度 如果小于20%就保留 大于就删除
+        sq = f"SELECT ROUND((COUNT(*) - COUNT(\"{value}\"))::NUMERIC / COUNT(*)*100, 2) AS empty_ratio FROM \"{tableName}\""
+        missRateData = pd.read_sql(sq, con=pg_connection)
+        print("缺失率：", missRateData['empty_ratio'][0])
+        if(missRateData['empty_ratio'][0]<20.0):
+            col.append(value)
+    if(len(col) > 10):
+        col = cols.head(10)
+    print("保留的：", col)
+    # 设置要聚类的类别数
+    n_clusters = 5
+    # 使用 K 均值聚类算法对样本进行聚类
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0)
+    # 使用 fit_predict() 方法进行聚类并返回每个样本所属的类别
+    data = databaseData[col['column_name']]
+    print(data)
+    data.fillna(data.mean(), inplace=True)
+    clusters = kmeans.fit_predict(data)
+    databaseData["label"] = clusters
+    # 对于每个类别，找到众数并填充缺失值
+    for cluster_id in range(n_clusters):
+        # 获取属于当前类别的样本
+        cluster_samples = databaseData[databaseData['label'] == cluster_id]
+
+        # 排除缺失值后找到该类别中 colName 属性的众数
+        mode_value = cluster_samples[colName].mode().iloc[0]
+
+        # 将该类别中缺失值的样本的 colName 属性填充为众数值
+        databaseData.loc[(databaseData['label'] == cluster_id) & (databaseData[colName].isnull()), colName] = mode_value
+    # 删除添加的聚类信息列
+    new_data = databaseData[colName].values.tolist()
+    print("old data:", old_data)
+    print("new Data:", new_data)
+    res = {
+        "old_data": old_data,
+        "new_data": new_data
+    }
+    return json.dumps(res)
 
 
 
@@ -389,23 +455,27 @@ def singleFactorAnalyze():
     tableName = param['tableName']
     sql = f"select \"range\" from \"field_management\" where \"feature_name\" = '{groupCol}'"
     databaseData = pd.read_sql(sql, con=pg_connection)
-    index_range = databaseData['range'][0]  # 获取分类标签
+    print(databaseData)
+    if databaseData['range'].size == 0:
+        # 查询数据库
+        sql2 = f"select distinct(\"{groupCol}\") as \"range\" from \"{tableName}\""
+        dis_value = pd.read_sql(sql2, con=pg_connection);
+        index_range = dis_value['range']
+    else:
+        index_range = databaseData['range'][0]  # 获取分类标签
     list  = []
     classInto = []
     for index in index_range:   # 先默认为二分类检验
         tempClassInfo = {}
         tempClassInfo['className'] = index
         sql = f"select \"{observeCol}\" from \"{tableName}\" where \"{groupCol}\" = '{index}'"
+        print("sql",sql)
         temp = pd.read_sql(sql, con=pg_connection)[observeCol]
         tempClassInfo['frequent'] = temp.size  # 总个数
         temp_valid = temp.dropna()  # 去除空值
         tempClassInfo['validFrequent'] = temp_valid.size  # 有效个数
         tempClassInfo['missFrequent'] = temp.size-temp_valid.size  # 缺失值个数
         list.append(temp_valid)
-
-        # # tempClassInfo = pd.Series(tempClassInfo)
-        # # tempClassInfo = tempClassInfo.to_dict()
-        # tempClassInfo = json.dumps(tempClassInfo)
         classInto.append(tempClassInfo)
     group1 = [float(x) for x in list[0]]
     group2 = [float(x) for x in list[1]]
@@ -444,8 +514,7 @@ def consistencyAnalyze():
     featureName = colNames[0]
     pg_connection = connect_pg()
     tableName = param['tableName']
-    print("tableName", tableName)
-    sql = f"select * from {tableName}"
+    sql = f"select * from \"{tableName}\""
     data = pd.read_sql(sql, con=pg_connection)
     try:
         numeric_columns = data.select_dtypes(include=['float64', 'int64']).columns
